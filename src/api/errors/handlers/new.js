@@ -148,6 +148,14 @@ module.exports = function getErrors(lines) {
   let doneParent = false;
 
   processors.forEach((processor, index) => {
+
+    // =============================================
+    // Added lines keeps track of the length of included
+    // copybooks after they have been expanded in the source map.
+    // We then use this to adjust the next copy book starting point
+    // inside of the source map. We only do this in the parent
+    // =============================================
+    let addedLines = {};
     
     processor.files.forEach((file) => {
 
@@ -174,6 +182,8 @@ module.exports = function getErrors(lines) {
             }
           };
 
+          if (addedLines[file.parent]) trueStartFrom += addedLines[file.parent];
+
           generatedLines.splice(trueStartFrom, 0, 
             ...Array(file.length).fill({})
               .map((x, i) => ({
@@ -182,6 +192,11 @@ module.exports = function getErrors(lines) {
               })
               )
           );
+
+          if (addedLines[file.parent])
+            addedLines[file.parent] += file.length;
+          else
+            addedLines[file.parent] = file.length;
         }
       }
       
@@ -251,7 +266,8 @@ module.exports = function getErrors(lines) {
 
           // To remove:
           if (expansion.defined.start >= 0 && expansion.defined.end >= 0) {
-            generatedLines.splice(file.startsAt + expansion.defined.start + 1, expansion.defined.end - expansion.defined.start + 1);
+            const size = expansion.defined.end - expansion.defined.start + 1;
+            generatedLines.splice(file.startsAt + expansion.defined.start + 1, size);
           }
         });
       }
