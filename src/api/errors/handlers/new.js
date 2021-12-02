@@ -1,8 +1,13 @@
 
+const ILEError = require(`../error`);
+const Line = require(`../line`);
+const Expansion = require(`../expansion`);
+const FileID = require(`../fileid`);
 const {
   formatName,
   formatIFS
 } = require(`../format`);
+const Processor = require(`../processor`);
 
 /**
  * Returns object of files and their errors
@@ -10,7 +15,7 @@ const {
  * @returns {{[FILE: string]: { sev: number, linenum: number, column: number, toColumn: number, text: string, code: string }[]}} Errors object
  */
 module.exports = function getErrors(lines) {
-  /** @type {{files: {id: number, parent?: number, startsAt: number, length?: number, path: string, errors: {sev: number, line: number, column: {start, end}, text: string, code: string, postExpansion?: boolean}[], expansions: {on: number, defined: {start, end}, range: {start, end}}[]}[]}[]} */
+  /** @type {Processor[]} */
   let processors = [];
 
   let pieces = [];
@@ -20,10 +25,16 @@ module.exports = function getErrors(lines) {
   let line;
   let tempFileID;
 
-  let currentProcessor;
+  /** @type {FileID} */
   let existingFile;
-  let parentIds = [];
-  let expanded = false;
+
+  /** @type {FileID} */
+  let baseFile = null;
+
+  /** @type {FileID[]} */
+  let deepFiles = [];
+
+  let currentFileIndex = 0;
 
   /** @type {{[id: number]: string}} */
   let truePaths = {};
@@ -47,12 +58,8 @@ module.exports = function getErrors(lines) {
 
     switch (curtype) {
     case `PROCESSOR`:
-      expanded = false;
-      if (currentProcessor) processors.push(currentProcessor);
-
-      currentProcessor = {
-        files: []
-      }
+      if (baseFile) processors.push(new Processor(baseFile));
+      baseFile = null;
       break;
 
     case `FILEID`:
@@ -61,45 +68,40 @@ module.exports = function getErrors(lines) {
       if (!truePaths[_FileID]) 
         truePaths[_FileID] = validName;
 
-      currentProcessor.files.push({
-        id: _FileID,
-        startsAt: Number(pieces[3])-1,
-        path: validName,
-        expansions: [],
-        errors: [],
-        parent: parentIds.length > 0 ? parentIds[parentIds.length - 1] : undefined
-      })
-      parentIds.push(_FileID);
+      const parent = deepFiles[deepFiles.length - 1];
+      const newFile = new FileID(_FileID, parent ? parent.id : null);
+      newFile.path = validName;
+      newFile.startsAt = Number(pieces[3])-1;
+      
+      deepFiles.push(newFile);
+      currentFileIndex += 1;
+
       break;
 
     case `FILEEND`:
-      existingFile = currentProcessor.files.find(x => x.id === _FileID);
-      if (existingFile)
-        existingFile.length = Number(pieces[3]);
-
-      parentIds.pop();
+      existingFile = deepFiles.pop();
+      existingFile.length = Number(pieces[3]);
+      if (deepFiles.length > 0)
+        deepFiles[deepFiles.length - 1].declarations.push(existingFile);
+      else
+        baseFile = existingFile;
       break;
 
     case `EXPANSION`:
-      expanded = true;
-      existingFile = currentProcessor.files.find(x => x.id === _FileID);
-
-      if (!existingFile) {
-        existingFile = currentProcessor.files[parentIds[parentIds.length - 1]];
-      }
+      existingFile = deepFiles[deepFiles.length - 1];
 
       if (existingFile) {
-        existingFile.expansions.push({
-          on: Number(pieces[5]),
-          defined: {
-            start: Number(pieces[3])-1,
-            end: Number(pieces[4])-1
-          },
-          range: {
-            start: Number(pieces[6])-1,
-            end: Number(pieces[7])-1
-          }
-        });
+        const newExpansion = new Expansion();
+        newExpansion.defined = {
+          start: Number(pieces[3])-1,
+          end: Number(pieces[4])-1
+        };
+        newExpansion.on = Number(pieces[5]);
+        newExpansion.range = {
+          start: Number(pieces[6])-1,
+          end: Number(pieces[7])-1
+        };
+        existingFile.declarations.push(newExpansion);
       }
       break;
 
@@ -111,24 +113,26 @@ module.exports = function getErrors(lines) {
       let text = line.substr(65).trim();
       let code = line.substr(48, 7).trim();
 
-      existingFile = currentProcessor.files.find(x => x.id === _FileID);
-      if (existingFile)
-        existingFile.errors.push({
-          sev,
-          line: linenum,
-          column: {
-            start: column,
-            end: toColumn
-          },
-          text,
-          code,
-          postExpansion: expanded
-        });
+      existingFile = deepFiles[deepFiles.length - 1];
+      if (existingFile) {
+        const newError = new ILEError();
+        newError.fileID = _FileID;
+        newError.sev = sev;
+        newError.linenum = linenum;
+        newError.column = column;
+        newError.toColumn = toColumn;
+        newError.text = text;
+        newError.code = code;
+        existingFile.declarations.push(newError);
+      }
       break;
     }
   }
 
-  if (currentProcessor) processors.push(currentProcessor);
+  // EXPAND FILE TO SOURCEMAP
+  // THEN HAND EXPANSIONS
+
+  if (baseFile) processors.push(new Processor(baseFile));
 
   console.log(processors);
 
@@ -139,162 +143,25 @@ module.exports = function getErrors(lines) {
   // Then we map each line number in the generated source to the original source (e.g. a source map)
   // =============================================
 
-  /** @type {{path?: string, line?: number, isSQL?: boolean}[]} */
-  let generatedLines = [];
+  /** @type {Line[]} */
+  let generatedLines = null;
 
-  /** @type {{[path: string]: object}} */
+  /** @type {{[path: string]: ILEError[]}} */
   let fileErrors = {};
 
   let doneParent = false;
 
-  processors.forEach((processor, index) => {
+  processors.forEach(processor => {
+    generatedLines = processor.expand(null, generatedLines);
+    console.log(generatedLines);
 
-    // =============================================
-    // Added lines keeps track of the length of included
-    // copybooks after they have been expanded in the source map.
-    // We then use this to adjust the next copy book starting point
-    // inside of the source map. We only do this in the parent
-    // =============================================
-    let addedLines = {};
-    
-    processor.files.forEach((file) => {
-
-      // =============================================
-      // First step is to generate add all of the copybooks. 
-      // We do this by looking at the file list in the base (parent) processor
-      // since that is what expands the copybooks.
-      // =============================================
-
-      if (!doneParent) {
-        if (file.id === 999) {
-        // Do nothing with the base          
-        } else {
-        // We need to find the true start position
-          let trueStartFrom = (file.startsAt+1);
-
-          let currentParent = processor.files.find(x => x.id === file.parent);
-          while (currentParent) {
-            if (currentParent && currentParent.startsAt >= 0) {
-              trueStartFrom += (currentParent.startsAt+1);
-              currentParent = processor.files.find(x => x.id === currentParent.parent);
-            } else {
-              break;
-            }
-          };
-
-          if (addedLines[file.parent]) trueStartFrom += addedLines[file.parent];
-
-          generatedLines.splice(trueStartFrom, 0, 
-            ...Array(file.length).fill({})
-              .map((x, i) => ({
-                path: file.path,
-                line: i + 1
-              })
-              )
-          );
-
-          if (addedLines[file.parent])
-            addedLines[file.parent] += file.length;
-          else
-            addedLines[file.parent] = file.length;
-        }
+    Object.keys(processor.errors).forEach(file => {
+      if (fileErrors[file]) {
+        fileErrors[file].push(...processor.errors[file]);
+      } else {
+        fileErrors[file] = processor.errors[file];
       }
-      
-
-      // =============================================
-      // Next, we add the errors from the file that are listed BEFORE any precompiler expansions
-      //
-      // We have two handles here. The first is the generated lines, which is the source map.
-      // The second is the errors, which is the normal error list for when *LVL1 is used, or a regular compiler
-      // =============================================
-
-      file.errors.filter(err => err.postExpansion !== true).forEach(error => {
-
-        if (processor.files.length === 1 || file.id === 1) {
-          let foundError = generatedLines[error.line];
-
-          if (foundError && foundError.isSQL !== true) {
-            if (!fileErrors[foundError.path]) fileErrors[foundError.path] = [];
-            fileErrors[foundError.path].push({
-              sev: error.sev,
-              linenum: foundError.line,
-              column: error.column.start,
-              toColumn: error.column.end,
-              text: error.text,
-              code: error.code
-            });
-          }
-        } else {
-          let truePath = truePaths[file.id];
-          if (!fileErrors[truePath]) fileErrors[truePath] = [];
-          fileErrors[truePath].push({
-            sev: error.sev,
-            linenum: error.line+1,
-            column: error.column.start,
-            toColumn: error.column.end,
-            text: error.text,
-            code: error.code
-          });
-        }
-      });
     });
-
-    // =============================================
-    // Next, we add the expansions from the precompiler
-    //
-    // The expansions are mighty complex. Not only can they add lines, they can also remove lines.
-    // =============================================
-
-    processor.files.forEach((file) => {
-      if (file.expansions.length > 0) {
-        file.expansions.forEach(expansion => {
-          // To add:
-          if (expansion.range.start >= 0 && expansion.range.end >= 0) {
-            const toFile = processor.files.find(x => x.id === expansion.on);
-            if (toFile) {
-              generatedLines.splice(toFile.startsAt + expansion.range.start + 1, 0, 
-                ...Array(expansion.range.end - expansion.range.start + 1).fill({})
-                  .map((x, i) => ({
-                    path: toFile.path,
-                    line: i + 1,
-                    isSQL: true
-                  })
-                  )
-              );
-            }
-          } else
-
-          // To remove:
-          if (expansion.defined.start >= 0 && expansion.defined.end >= 0) {
-            const size = expansion.defined.end - expansion.defined.start + 1;
-            generatedLines.splice(file.startsAt + expansion.defined.start + 1, size);
-          }
-        });
-      }
-
-      // =============================================
-      // Finally, we add the errors from the file that are listed AFTER any precompiler expansions
-      // =============================================
-
-      file.errors.filter(err => err.postExpansion === true).forEach(error => {
-        let foundError = generatedLines[error.line];
-  
-        if (foundError && foundError.isSQL !== true) {
-          if (!fileErrors[foundError.path]) fileErrors[foundError.path] = [];
-          fileErrors[foundError.path].push({
-            sev: error.sev,
-            linenum: foundError.line,
-            column: error.column.start,
-            toColumn: error.column.end,
-            text: error.text,
-            code: error.code
-          });
-        }
-      });
-    });
-
-    doneParent = true;
-
   });
 
   console.log({generatedLines, lines});
