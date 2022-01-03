@@ -11,7 +11,7 @@ let remoteApps = [
   },
   {
     path: `/usr/bin/`,
-    names: [`setccsid`, `db2`]
+    names: [`setccsid`, `db2`, `uname`]
   }
 ];
 
@@ -46,6 +46,7 @@ module.exports = class IBMi {
       tn5250: undefined,
       setccsid: undefined,
       db2: undefined,
+      uname: undefined,
       'GENCMDXML.PGM': undefined
     };
   }
@@ -239,6 +240,29 @@ module.exports = class IBMi {
         //Even if db2util is installed, but they have disabled it... then disable it
         if (this.config.enableSQL !== true) {
           this.remoteFeatures.db2util = undefined;
+        }
+
+        // Check 
+        let validVersion = false;
+
+        if (this.remoteFeatures.uname) {
+          progress.report({
+            message: `Checking system version.`
+          });
+
+          const versions = await this.paseCommand(`${this.remoteFeatures.uname} -rv`, `.`);
+          if (versions && typeof versions === `string`) {
+            const [minor, major] = versions.split(` `);
+            if (major === `7` && [`2`, `3`, `4`].includes(minor)) {
+              validVersion = true;
+            }
+          }
+        }
+
+        if (!validVersion) {
+          progress.report({
+            message: `Unsupported IBM i version. Code for IBM i may not function correctly.`,
+          });
         }
 
         if (this.remoteFeatures.db2util) {
