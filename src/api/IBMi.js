@@ -420,7 +420,7 @@ module.exports = class IBMi {
             }
           }
           
-        } catch (e) {
+        } on Exception catch (e) {
           console.log(e);
         }
 
